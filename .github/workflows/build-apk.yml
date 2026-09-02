@@ -1,0 +1,190 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build NEXUS FX APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
+
+      - name: Locate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "$GITHUB_WORKSPACE/_buildsrc"
+          mkdir -p "$GITHUB_WORKSPACE/_buildsrc"
+
+          # Direct Android project
+          if [ -f "$GITHUB_WORKSPACE/settings.gradle.kts" ] || \
+             [ -f "$GITHUB_WORKSPACE/settings.gradle" ]; then
+
+            echo "PROJECT_DIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+            echo "Using Android project directly."
+            exit 0
+          fi
+
+          # Otherwise find a ZIP
+          ZIP_FILE="$(find "$GITHUB_WORKSPACE" \
+            -maxdepth 1 \
+            -type f \
+            -iname '*.zip' \
+            -print -quit)"
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No Android project or ZIP found."
+            exit 1
+          fi
+
+          echo "Using ZIP:"
+          echo "$ZIP_FILE"
+
+          unzip -q -o "$ZIP_FILE" \
+            -d "$GITHUB_WORKSPACE/_buildsrc/project"
+
+          # Handle nested ZIPs
+          for i in 1 2 3 4 5; do
+
+            NESTED_ZIP="$(
+              find "$GITHUB_WORKSPACE/_buildsrc/project" \
+                -type f \
+                -iname '*.zip' \
+                -print -quit || true
+            )"
+
+            if [ -z "$NESTED_ZIP" ]; then
+              echo "No more nested ZIPs."
+              break
+            fi
+
+            ZIP_DIR="$(dirname "$NESTED_ZIP")"
+            OUT_DIR="$ZIP_DIR/_nested_$i"
+
+            mkdir -p "$OUT_DIR"
+
+            echo "Extracting nested ZIP:"
+            echo "$NESTED_ZIP"
+
+            unzip -q -o "$NESTED_ZIP" -d "$OUT_DIR"
+
+            rm -f "$NESTED_ZIP"
+          done
+
+          PROJECT_DIR=""
+
+          while IFS= read -r SETTINGS; do
+
+            DIR="$(dirname "$SETTINGS")"
+
+            if [ -f "$DIR/app/build.gradle.kts" ] || \
+               [ -f "$DIR/app/build.gradle" ]; then
+
+              PROJECT_DIR="$DIR"
+              break
+            fi
+
+          done < <(
+            find "$GITHUB_WORKSPACE/_buildsrc/project" \
+              -type f \
+              \( \
+                -name "settings.gradle.kts" \
+                -o -name "settings.gradle" \
+              \) \
+              -print
+          )
+
+          if [ -z "$PROJECT_DIR" ]; then
+
+            echo "ERROR: Android Gradle project not found."
+
+            echo ""
+            echo "Gradle files found:"
+
+            find "$GITHUB_WORKSPACE/_buildsrc/project" \
+              -type f \
+              \( \
+                -name "settings.gradle.kts" \
+                -o -name "settings.gradle" \
+                -o -name "build.gradle.kts" \
+                -o -name "build.gradle" \
+              \) \
+              -print
+
+            exit 1
+          fi
+
+          echo "ANDROID PROJECT:"
+          echo "$PROJECT_DIR"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Verify project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "$PROJECT_DIR/settings.gradle.kts" || \
+          test -f "$PROJECT_DIR/settings.gradle"
+
+          test -f "$PROJECT_DIR/app/build.gradle.kts" || \
+          test -f "$PROJECT_DIR/app/build.gradle"
+
+          echo "Project verified successfully."
+
+      - name: Build Debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$(
+            find "$PROJECT_DIR/app/build/outputs/apk" \
+              -type f \
+              -name "*.apk" \
+              -print -quit || true
+          )"
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "APK SUCCESSFULLY CREATED:"
+          ls -lh "$APK"
+
+          mkdir -p "$GITHUB_WORKSPACE/apk-output"
+
+          cp "$APK" \
+            "$GITHUB_WORKSPACE/apk-output/NEXUS-FX-debug.apk"
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-FX-debug-apk
+          path: apk-output/NEXUS-FX-debug.apk
+          if-no-files-found: error
